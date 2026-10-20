@@ -34,6 +34,7 @@
 #include <spa/pod/iter.h>
 #include <spa/param/video/raw.h>
 #include <spa/param/video/format.h>
+#include <spa/param/buffers.h>
 #include <spa/utils/result.h>
 #include <spa/utils/json.h>
 
@@ -80,6 +81,8 @@ static void (*PIPEWIRE_pw_thread_loop_lock)(struct pw_thread_loop *);
 static void (*PIPEWIRE_pw_thread_loop_unlock)(struct pw_thread_loop *);
 static void (*PIPEWIRE_pw_thread_loop_signal)(struct pw_thread_loop *, bool);
 static void (*PIPEWIRE_pw_thread_loop_wait)(struct pw_thread_loop *);
+static int (*PIPEWIRE_pw_thread_loop_get_time)(struct pw_thread_loop *, struct timespec *, int64_t);
+static int (*PIPEWIRE_pw_thread_loop_timed_wait_full)(struct pw_thread_loop *, const struct timespec *);
 static int (*PIPEWIRE_pw_thread_loop_start)(struct pw_thread_loop *);
 static struct pw_context *(*PIPEWIRE_pw_context_new)(struct pw_loop *, struct pw_properties *, size_t);
 static void (*PIPEWIRE_pw_context_destroy)(struct pw_context *);
@@ -102,6 +105,7 @@ static int (*PIPEWIRE_pw_stream_connect)(struct pw_stream *, enum pw_direction, 
 static enum pw_stream_state (*PIPEWIRE_pw_stream_get_state)(struct pw_stream *stream, const char **error);
 static struct pw_buffer *(*PIPEWIRE_pw_stream_dequeue_buffer)(struct pw_stream *);
 static int (*PIPEWIRE_pw_stream_queue_buffer)(struct pw_stream *, struct pw_buffer *);
+static int (*PIPEWIRE_pw_stream_update_params)(struct pw_stream *, const struct spa_pod **, uint32_t);
 static struct pw_properties *(*PIPEWIRE_pw_properties_new)(const char *, ...)SPA_SENTINEL;
 static struct pw_properties *(*PIPEWIRE_pw_properties_new_dict)(const struct spa_dict *dict);
 static int (*PIPEWIRE_pw_properties_set)(struct pw_properties *, const char *, const char *);
@@ -185,6 +189,8 @@ static bool load_pipewire_syms(void)
     SDL_PIPEWIRE_SYM(pw_thread_loop_unlock);
     SDL_PIPEWIRE_SYM(pw_thread_loop_signal);
     SDL_PIPEWIRE_SYM(pw_thread_loop_wait);
+    SDL_PIPEWIRE_SYM(pw_thread_loop_get_time);
+    SDL_PIPEWIRE_SYM(pw_thread_loop_timed_wait_full);
     SDL_PIPEWIRE_SYM(pw_thread_loop_start);
     SDL_PIPEWIRE_SYM(pw_context_new);
     SDL_PIPEWIRE_SYM(pw_context_destroy);
@@ -206,6 +212,7 @@ static bool load_pipewire_syms(void)
     SDL_PIPEWIRE_SYM(pw_stream_get_state);
     SDL_PIPEWIRE_SYM(pw_stream_dequeue_buffer);
     SDL_PIPEWIRE_SYM(pw_stream_queue_buffer);
+    SDL_PIPEWIRE_SYM(pw_stream_update_params);
     SDL_PIPEWIRE_SYM(pw_properties_new);
     SDL_PIPEWIRE_SYM(pw_properties_new_dict);
     SDL_PIPEWIRE_SYM(pw_properties_set);
@@ -429,6 +436,7 @@ struct SDL_PrivateCameraData
     struct spa_hook stream_listener;
 
     struct pw_array buffers;
+    bool failed;  // the stream went into the error state; protected by the hotplug loop lock.
 };
 
 static void on_process(void *data)
@@ -446,6 +454,14 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
     case PW_STREAM_STATE_STREAMING:
         SDL_CameraPermissionOutcome(device, true);
         break;
+    case PW_STREAM_STATE_ERROR:
+        // We hold the loop lock here, so don't call SDL_CameraDisconnected():
+        // the camera thread takes the device lock before the loop lock.
+        // Wake up WaitDevice() instead, which reports the failure.
+        SDL_LogError(SDL_LOG_CATEGORY_SYSTEM, "PipeWire camera stream error: %s", error ? error : "unknown");
+        device->hidden->failed = true;
+        PIPEWIRE_pw_thread_loop_signal(hotplug.loop, false);
+        break;
     default:
         break;
     }
@@ -453,6 +469,24 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
 
 static void on_stream_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
+    SDL_Camera *device = data;
+    uint8_t buffer[PW_POD_BUFFER_LENGTH];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    const struct spa_pod *params[1];
+
+    if (id != SPA_PARAM_Format || param == NULL) {
+        return;
+    }
+
+    // Without a Buffers param, the link fails to negotiate buffers with
+    // "error use input buffers: -22 (Invalid argument)" and the stream
+    // never starts.  We map the buffers (PW_STREAM_FLAG_MAP_BUFFERS), so
+    // we can take them in memory or as a file descriptor.
+    params[0] = spa_pod_builder_add_object(&b,
+            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
+                (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_DmaBuf)));
+    PIPEWIRE_pw_stream_update_params(device->hidden->stream, params, 1);
 }
 
 static void on_add_buffer(void *data, struct pw_buffer *buffer)
@@ -571,10 +605,19 @@ static void PIPEWIRECAMERA_CloseDevice(SDL_Camera *device)
 
 static bool PIPEWIRECAMERA_WaitDevice(SDL_Camera *device)
 {
+    struct timespec abstime;
+    bool result;
+
     PIPEWIRE_pw_thread_loop_lock(hotplug.loop);
-    PIPEWIRE_pw_thread_loop_wait(hotplug.loop);
+    if (!device->hidden->failed) {
+        // Don't wait forever: if no frame arrives, the camera thread must
+        // still notice that the device is being closed.
+        PIPEWIRE_pw_thread_loop_get_time(hotplug.loop, &abstime, 100 * SPA_NSEC_PER_MSEC);
+        PIPEWIRE_pw_thread_loop_timed_wait_full(hotplug.loop, &abstime);
+    }
+    result = !device->hidden->failed;
     PIPEWIRE_pw_thread_loop_unlock(hotplug.loop);
-    return true;
+    return result;
 }
 
 static SDL_CameraFrameResult PIPEWIRECAMERA_AcquireFrame(SDL_Camera *device, SDL_Surface *frame, Uint64 *timestampNS, float *rotation)
